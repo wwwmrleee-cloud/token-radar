@@ -1,12 +1,15 @@
-// Token Radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board ranks EVERY protocol that passes the watchlist's own eligibility rule (not just the 40
 // on the watchlist): it records no token (no market cap, no CoinGecko id, no symbol), it is not a
-// CEX, a bridge or a liquid-staking product, its name carries no version marker and no whole word
-// wrapped / staked / staking, and it does not begin with an exchange's name. That rule is applied
-// to all 758 protocols, so the board is 198 rows: the 40 watchlist rows plus 158 early rows the
-// floor leaves out. A protocol that already trades is never ranked: the live-token set is kept
-// apart and shown with its market cap, the market's own value, never a model's.
+// CEX, a bridge or a liquid-staking product, its name carries no whole word wrapped / staked /
+// staking, and it does not begin with an exchange's name. A version marker (V2, V3, 2.0) excludes
+// a name only when the unversioned parent already trades or is already ranked: a version of a
+// tokenized protocol is a deployment of it, but a version with no parent on record is a protocol
+// in its own right, so the largest-TVL version of such a name is ranked and the rest set aside.
+// That rule is applied to all 758 protocols, so the board is the 40 watchlist rows plus every
+// early row the floor leaves out. A protocol that already trades is never ranked: the live-token
+// set is kept apart and shown with its market cap, the market's own value, never a model's.
 //
 // Implied value follows only from the snapshot's own figures, and no protocol name is ever
 // special-cased:
@@ -63,10 +66,14 @@ export interface ModelConstants {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
-export const LIVE_ROWS = 24;
+export const LIVE_ROWS = 40;
+
+/** A live-token ratio outside this band is set aside from the Live view, not from the model. */
+export const LIVE_RATIO_MIN = 0.005;
+export const LIVE_RATIO_MAX = 10;
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -132,6 +139,12 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
+  /** This row's 7-day growth against its own category's median, and the market's median. */
+  cat_med_7d: number | null;
+  mkt_med_7d: number | null;
+  /** Rank inside its own category (1 = strongest implied value there), and the category's size. */
+  cat_rank: number;
+  cat_size: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -143,6 +156,22 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+}
+
+/** One chain's board presence: how many ranked rows run on it, their implied value, its top row. */
+export interface ChainTop {
+  name: string;
+  rows: number;
+  implied: number;
+  top: string;
+}
+
+/** One category's board slice: rows, total implied value, median 7-day growth. */
+export interface CatTop {
+  name: string;
+  rows: number;
+  implied: number;
+  med_7d: number | null;
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -160,6 +189,19 @@ export interface RadarData {
   total_implied_usd: number;
   rows: RadarRow[];
   live: LiveRow[];
+  /** Live-token protocols set aside from the Live view for an extreme mcap/TVL ratio. */
+  live_outliers: number;
+  /** Live-token records that carry no market cap in this snapshot, so no ratio can be read. */
+  live_no_mcap: number;
+  /** Chains ranked by how many board rows run on them, top 12. */
+  chains_top: ChainTop[];
+  /** Categories ranked by total implied value. */
+  cats_top: CatTop[];
+  /** Slugs of the 8 fastest-growing board rows by 7-day growth, and the 5 newest by TVL. */
+  movers: string[];
+  new_top: string[];
+  /** Median 7-day growth across the whole board, for the detail view's momentum bars. */
+  mkt_med_7d: number | null;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -254,17 +296,22 @@ export function isPreToken(p: SnapshotProtocol): boolean {
   return p.mcap_usd == null && p.gecko_id == null && p.symbol == null;
 }
 
+/** The unversioned parent name of a versioned name, or null when the name carries no version. */
+export function versionBase(name: string): string | null {
+  const m = VERSIONED.exec(name);
+  return m ? name.slice(0, m.index).trim() : null;
+}
+
 /**
- * Whether a protocol is one the board may rank: pre-token, and passing the watchlist's own
- * eligibility rule as far as the snapshot shows it (category, name and exchange prefix). A
- * protocol the snapshot cannot clear on those grounds is set aside, never ranked.
+ * Whether a protocol passes the eligibility rule's static checks (pre-token, category, name
+ * words, exchange prefix). The version marker is handled separately in buildBoard: a versioned
+ * name is set aside only when its parent already trades or is already ranked.
  */
-export function isRankable(p: SnapshotProtocol): boolean {
+export function passesStatic(p: SnapshotProtocol): boolean {
   if (!isPreToken(p)) return false;
   const cat = (p.category ?? '').toLowerCase();
   if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
   if (cat.includes('bridge') || cat.includes('wrapper')) return false;
-  if (VERSIONED.test(p.name)) return false;
   if (WRAPPED.test(p.name)) return false;
   if (EXCHANGES.some((e) => p.name.startsWith(e))) return false;
   return true;
@@ -275,10 +322,31 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The live-token protocols, by market cap, for the dashboard's Live token view. */
+/** The median of a list of numbers, or null when it is empty. */
+function medianOf(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return median(values.slice().sort((a, b) => a - b));
+}
+
+/** A live-token protocol's mcap/TVL ratio, or null when it cannot be read off the snapshot. */
+export function liveRatio(p: SnapshotProtocol): number | null {
+  if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) return null;
+  return p.mcap_usd / p.tvl_usd;
+}
+
+/**
+ * The live-token protocols, by market cap, for the dashboard's Live token view. A row is shown
+ * only when its mcap/TVL sits inside [0.005x, 10x]: a live protocol whose token trades hundreds
+ * of times above its TVL is a token-attribution quirk of the snapshot, and showing it unexplained
+ * reads as a data bug. The model median is untouched: it is taken over every live ratio.
+ */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
     .filter((p) => !isPreToken(p) && p.category !== 'CEX')
+    .filter((p) => {
+      const r = liveRatio(p);
+      return r !== null && r >= LIVE_RATIO_MIN && r <= LIVE_RATIO_MAX;
+    })
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .slice(0, LIVE_ROWS)
     .map((p) => ({
@@ -290,6 +358,23 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
       mcap_usd: p.mcap_usd,
       change_7d: p.change_7d,
     }));
+}
+
+/** How many live-token protocols the Live view sets aside for an extreme mcap/TVL ratio. */
+export function liveOutliers(snapshot: Snapshot): number {
+  return snapshot.protocols.filter((p) => {
+    if (isPreToken(p) || p.category === 'CEX') return false;
+    const r = liveRatio(p);
+    return r !== null && (r < LIVE_RATIO_MIN || r > LIVE_RATIO_MAX);
+  }).length;
+}
+
+/** How many live-token records carry no readable market cap in this snapshot. */
+export function liveNoMcap(snapshot: Snapshot): number {
+  return snapshot.protocols.filter((p) => {
+    if (isPreToken(p) || p.category === 'CEX') return false;
+    return liveRatio(p) === null;
+  }).length;
 }
 
 /**
@@ -337,7 +422,30 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants): BoardRow[
   const index = bySlug(snapshot.protocols);
   const watch = new Set(snapshot.watchlist);
   const liveAll = snapshot.protocols.filter((p) => !isPreToken(p));
-  const chosen = snapshot.protocols.filter((p) => isRankable(p));
+  const liveNames = new Set(liveAll.map((p) => p.name.toLowerCase()));
+  // Static checks first; the version marker is resolved here, not in passesStatic: a versioned
+  // name whose parent already trades, or is already ranked under its plain name, is a deployment
+  // of that protocol and is set aside. A versioned name with no parent on record is ranked on
+  // its largest-TVL version alone, so one protocol never takes two rows.
+  const statics = snapshot.protocols.filter((p) => passesStatic(p));
+  const plainNames = new Set(statics.filter((p) => versionBase(p.name) === null).map((p) => p.name.toLowerCase()));
+  const byBase = new Map<string, SnapshotProtocol[]>();
+  const chosen: SnapshotProtocol[] = [];
+  for (const p of statics) {
+    const base = versionBase(p.name);
+    if (base === null) {
+      chosen.push(p);
+      continue;
+    }
+    const list = byBase.get(base.toLowerCase()) ?? [];
+    list.push(p);
+    byBase.set(base.toLowerCase(), list);
+  }
+  for (const [base, list] of byBase) {
+    if (liveNames.has(base) || plainNames.has(base)) continue;
+    list.sort((a, b) => b.tvl_usd - a.tvl_usd);
+    chosen.push(list[0]!);
+  }
   // The watchlist is the floor: every slug on it must be ranked, even if the eligibility rule
   // above would set it aside on the fields the snapshot shows (it cannot, but coverage is the
   // gate's row and is never gambled on a missing record).
@@ -434,6 +542,8 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('prediction')) return `Fund ${name} with $${capital} on ${chain} and place one position on a market that settles within the month.`;
   if (c.includes('stablecoin') || c.includes('dual-token') || c.includes('anchor btc') || c.includes('decentralized btc')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain} and hold it.`;
   if (c.includes('chain')) return `Bridge $${capital} of USDC to ${chain} through its official bridge and use ${name}'s flagship app with the funds.`;
+  if (c.includes('options')) return `Deposit $${capital} of USDC as margin on ${name} on ${chain} and open one small defined-risk option position.`;
+  if (c.includes('privacy')) return `Deposit $${capital} of USDC into ${name}'s privacy pool on ${chain} and keep the shielded balance open.`;
   if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy active.`;
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
@@ -451,6 +561,8 @@ function secondActionFor(p: SnapshotProtocol, chain: string): string {
   if (c.includes('prediction')) return `Place a second $10 position on a different ${name} market the next week.`;
   if (c.includes('stablecoin') || c.includes('dual-token') || c.includes('anchor btc') || c.includes('decentralized btc')) return `Swap $25 of the asset through ${name}'s own route on ${chain} and hold the result.`;
   if (c.includes('chain')) return `Stake or deposit $25 of the bridged funds in ${name}'s main app on ${chain}.`;
+  if (c.includes('options')) return `Close the option position and open a fresh one the following week, keeping the size near $25.`;
+  if (c.includes('privacy')) return `Shield a second $25 deposit through ${name} the following week so the pool shows repeat activity.`;
   if (c.includes('insurance')) return `Extend the cover by $25 before it lapses so the policy stays continuous.`;
   return `Make a second $25 deposit into ${name} the following week.`;
 }
@@ -505,7 +617,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 }
 
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, catMed7d: number | null, mktMed7d: number | null, catRank: number, catSize: number): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -524,6 +636,10 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     breadth_multiplier: row.model.breadth_multiplier,
+    cat_med_7d: catMed7d,
+    mkt_med_7d: mktMed7d,
+    cat_rank: catRank,
+    cat_size: catSize,
   };
 }
 
@@ -533,6 +649,54 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !r.watchlist).length;
+  // Category slices, in board order, so a row's index inside its slice is its category rank.
+  const byCat = new Map<string, BoardRow[]>();
+  for (const r of board) {
+    const k = r.category ?? 'Other';
+    const list = byCat.get(k) ?? [];
+    list.push(r);
+    byCat.set(k, list);
+  }
+  const catMed = new Map<string, number | null>();
+  const catsTop: CatTop[] = [...byCat.entries()]
+    .map(([name, rs]) => {
+      const med = medianOf(rs.map((r) => r.change_7d).filter((x): x is number => x !== null));
+      catMed.set(name, med);
+      return { name, rows: rs.length, implied: rs.reduce((n, r) => n + r.implied_value_usd, 0), med_7d: med };
+    })
+    .sort((a, b) => b.implied - a.implied);
+  const catRankOf = new Map<string, number>();
+  const catSizeOf = new Map<string, number>();
+  for (const [name, rs] of byCat) {
+    catSizeOf.set(name, rs.length);
+    rs.forEach((r, i) => catRankOf.set(r.slug, i + 1));
+  }
+  const mktMed = medianOf(board.map((r) => r.change_7d).filter((x): x is number => x !== null));
+  // Chains by board presence: a row counts once per chain it runs on; TVL is never split across
+  // chains (the snapshot carries no per-chain TVL), so chains are ranked by rows, then implied.
+  const byChain = new Map<string, BoardRow[]>();
+  for (const r of board) for (const c of r.chains) {
+    const list = byChain.get(c) ?? [];
+    list.push(r);
+    byChain.set(c, list);
+  }
+  const chainsTop: ChainTop[] = [...byChain.entries()]
+    .map(([name, rs]) => ({ name, rows: rs.length, implied: rs.reduce((n, r) => n + r.implied_value_usd, 0), top: rs[0]!.name }))
+    .sort((a, b) => b.rows - a.rows || b.implied - a.implied)
+    .slice(0, 12);
+  const movers = board
+    .filter((r) => r.change_7d !== null)
+    .sort((a, b) => (b.change_7d ?? 0) - (a.change_7d ?? 0))
+    .slice(0, 8)
+    .map((r) => r.slug);
+  const newTop = board
+    .filter((r) => r.age_days !== null && r.age_days < 180)
+    .sort((a, b) => b.tvl_usd - a.tvl_usd)
+    .slice(0, 5)
+    .map((r) => r.slug);
+  const rows = board.map((r) =>
+    radarRow(r, catMed.get(r.category ?? 'Other') ?? null, mktMed, catRankOf.get(r.slug) ?? 1, catSizeOf.get(r.category ?? 'Other') ?? 1),
+  );
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -545,8 +709,15 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     live_size: live.length,
     set_aside: snapshot.protocols.length - board.length,
     total_implied_usd: board.reduce((n, r) => n + r.implied_value_usd, 0),
-    rows: board.map(radarRow),
+    rows,
     live,
+    live_outliers: liveOutliers(snapshot),
+    live_no_mcap: liveNoMcap(snapshot),
+    chains_top: chainsTop,
+    cats_top: catsTop,
+    movers,
+    new_top: newTop,
+    mkt_med_7d: mktMed,
   };
   return { board, radar };
 }

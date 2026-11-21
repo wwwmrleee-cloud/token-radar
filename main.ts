@@ -1,4 +1,4 @@
-// Token Radar, radar-2 (Node 22, standard library only).
+// Token Radar, radar-3 (Node 22, standard library only).
 //
 // main.ts reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
 // every pre-token protocol with the model in lib/model.ts, writes the ranked board to
